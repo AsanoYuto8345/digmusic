@@ -90,6 +90,13 @@ class MainWindow(QWidget):
         self.rest_total_sec = 60
         self.rest_start_epoch: Optional[float] = None
         self.in_rest_mode = False
+        
+        # # UI alive heartbeat (debug)
+        # self._ui_hb = QTimer(self)
+        # self._ui_hb.setInterval(1000)
+        # self._ui_hb.timeout.connect(lambda: print("[UI] alive", flush=True))
+        # self._ui_hb.start()
+
 
     # ---------- Home ----------
     def _build_home(self) -> QWidget:

@@ -57,8 +57,8 @@ def rr_stream(
 
             line = ser.readline()  # timeout=1 なので最大1秒で返る
             if not line:
+                print("[SERIAL] timeout (no data)", flush=True)
                 continue
-
             try:
                 s = line.decode("utf-8", errors="ignore").strip()
             except Exception:
