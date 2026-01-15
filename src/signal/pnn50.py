@@ -1,59 +1,81 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from collections import deque
-from typing import Deque, Optional
+from dataclasses import dataclass
+from typing import List, Optional
 
 
 @dataclass
+class RRStats:
+    hr_bpm: Optional[float]
+    pnn50: Optional[float]
+
+
 class PNN50Calculator:
     """
-    RR(ms) を順に追加していき、直近 window_beats 拍分で pNN50(%) を計算する。
-    - |RR[i]-RR[i-1]| > threshold_ms の割合(%)
-    - 外れ値RRは捨てる
-    - 直前RRからの急変も捨てる（偽ピーク対策）
+    RR(ms)列から
+      - HR(bpm)
+      - pNN50(%)
+    を計算する。
+
+    重要：
+    - max_jump_ms を超える大ジャンプが来たら reject せず「リセットして採用」する
+      → 最初のゴミ値で永遠にrejectになる事故を防ぐ
     """
-    window_beats: int = 30
-    threshold_ms: int = 50
-    rr_min_ms: int = 300
-    rr_max_ms: int = 2000
 
-    # ★追加：急変フィルタ
-    max_jump_ms: int = 250  # 直前RRとの差がこれより大きければ捨てる（調整可）
+    def __init__(self, window_beats: int = 30, max_jump_ms: int = 250):
+        self.window_beats = int(window_beats)
+        self.max_jump_ms = int(max_jump_ms)
+        self._rr: List[int] = []
 
-    rr: Deque[int] = field(default_factory=lambda: deque(maxlen=30))
+    def reset(self) -> None:
+        self._rr.clear()
 
     def add_rr(self, rr_ms: int) -> bool:
-        if rr_ms < self.rr_min_ms or rr_ms > self.rr_max_ms:
+        rr_ms = int(rr_ms)
+
+        # ざっくり妥当レンジ（明らかに壊れた値は捨てる）
+        # 200ms=300bpm, 2000ms=30bpm
+        if rr_ms < 200 or rr_ms > 2000:
             return False
 
-        if self.rr:
-            prev = self.rr[-1]
-            if abs(rr_ms - prev) > self.max_jump_ms:
-                return False
+        if len(self._rr) == 0:
+            self._rr.append(rr_ms)
+            return True
 
-        if self.rr.maxlen != self.window_beats:
-            old = list(self.rr)[-self.window_beats:]
-            self.rr = deque(old, maxlen=self.window_beats)
+        prev = self._rr[-1]
+        jump = abs(rr_ms - prev)
 
-        self.rr.append(rr_ms)
+        # ★ここが今回の本命修正：
+        # 大ジャンプは reject ではなく「バッファリセットして採用」
+        if jump > self.max_jump_ms:
+            self._rr = [rr_ms]
+            return True
+
+        # 通常追加
+        self._rr.append(rr_ms)
+        if len(self._rr) > self.window_beats:
+            self._rr = self._rr[-self.window_beats :]
         return True
 
-    def is_ready(self) -> bool:
-        return len(self.rr) >= self.window_beats
-
-    def pnn50_percent(self) -> Optional[float]:
-        if not self.is_ready():
-            return None
-
-        diffs = [abs(self.rr[i] - self.rr[i - 1]) for i in range(1, len(self.rr))]
-        if not diffs:
-            return None
-
-        count = sum(1 for d in diffs if d > self.threshold_ms)
-        return (count / len(diffs)) * 100.0
-
     def hr_bpm(self) -> Optional[float]:
-        if not self.rr:
+        if not self._rr:
             return None
-        return 60000.0 / float(self.rr[-1])
+        rr = self._rr[-1]
+        if rr <= 0:
+            return None
+        return 60000.0 / rr
+
+    def pnn50_percent(self, min_diffs: int = 10) -> Optional[float]:
+        """
+        RR差分が min_diffs 個以上ないと None を返す。
+        pNN50は「連続RR差の絶対値が50msを超えた割合(%)」
+        """
+        if len(self._rr) < 2:
+            return None
+
+        diffs = [abs(self._rr[i] - self._rr[i - 1]) for i in range(1, len(self._rr))]
+        if len(diffs) < int(min_diffs):
+            return None
+
+        cnt = sum(1 for d in diffs if d > 50)
+        return 100.0 * cnt / len(diffs)

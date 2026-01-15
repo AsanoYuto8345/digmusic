@@ -1,113 +1,86 @@
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
-from typing import Optional, Iterator
+from typing import Iterator, Optional, Callable
+import time
 
 import serial
-from serial.tools import list_ports
+import serial.tools.list_ports
 
 
 @dataclass(frozen=True)
 class RRMessage:
     rr_ms: int
-    raw_line: str
+    raw: str
 
 
-def guess_port() -> Optional[str]:
+def _auto_detect_port() -> Optional[str]:
     """
-    WindowsでArduinoっぽいポートを雑に推測する。
-    見つからなければ None。
+    Arduinoっぽいポートを雑に探す。見つからなければ None。
     """
-    ports = list(list_ports.comports())
+    ports = list(serial.tools.list_ports.comports())
     if not ports:
         return None
-
-    # よくある説明文キーワード
-    keywords = ["Arduino", "CH340", "USB-SERIAL", "Silicon Labs", "CP210", "FTDI"]
-
+    # まずは "Arduino" っぽいの優先
     for p in ports:
-        desc = (p.description or "")
-        if any(k.lower() in desc.lower() for k in keywords):
+        desc = (p.description or "").lower()
+        manu = (p.manufacturer or "").lower()
+        if "arduino" in desc or "arduino" in manu:
             return p.device
-
-    # それっぽいのが無ければ先頭を返す
+    # それ以外は先頭
     return ports[0].device
-
-
-def parse_rr_line(line: str) -> Optional[int]:
-    """
-    期待フォーマット:
-      RR,812
-    もしくは
-      812
-    """
-    s = line.strip()
-    if not s:
-        return None
-
-    if s.startswith("RR,"):
-        try:
-            return int(s.split(",", 1)[1])
-        except Exception:
-            return None
-
-    # フォールバック: 数字だけの行
-    if s.isdigit():
-        return int(s)
-
-    return None
 
 
 def rr_stream(
     port: Optional[str] = None,
     baudrate: int = 115200,
-    timeout: float = 1.0,
-    reconnect: bool = True,
+    stop_check: Optional[Callable[[], bool]] = None,
 ) -> Iterator[RRMessage]:
     """
-    RR(ms) を延々と yield するジェネレータ。
-    - Arduinoリセット直後の "READY" みたいな行は無視する
-    - 切断されたら再接続する（reconnect=Trueのとき）
+    Arduinoから "RR,993" みたいな1行を受け取る想定。
+
+    stop_check が True を返したら終了する。
+    重要：timeout付き読み取りにして、ブロックで固まらないようにする。
     """
     if port is None:
-        port = guess_port()
+        port = _auto_detect_port()
+        if port is None:
+            raise RuntimeError("シリアルポートが見つかりませんでした。COM番号を指定してください。")
 
-    if port is None:
-        raise RuntimeError("シリアルポートが見つかりません。Arduino接続を確認してね。")
+    # timeoutが肝：ここが無いと stop しても抜けられず固まる
+    ser = serial.Serial(port, baudrate=baudrate, timeout=1)
 
-    while True:
+    try:
+        while True:
+            if stop_check is not None and stop_check():
+                return
+
+            line = ser.readline()  # timeout=1 なので最大1秒で返る
+            if not line:
+                continue
+
+            try:
+                s = line.decode("utf-8", errors="ignore").strip()
+            except Exception:
+                continue
+
+            # 例: "RR,993"
+            if not s.startswith("RR,"):
+                continue
+
+            parts = s.split(",", 1)
+            if len(parts) != 2:
+                continue
+
+            try:
+                rr = int(parts[1])
+            except ValueError:
+                continue
+
+            yield RRMessage(rr_ms=rr, raw=s)
+
+    finally:
         try:
-            with serial.Serial(port, baudrate=baudrate, timeout=timeout) as ser:
-                # Arduino接続直後はリセットでゴミが来ることがあるので少し待つ
-                time.sleep(1.0)
-                ser.reset_input_buffer()
-
-                while True:
-                    raw = ser.readline().decode("utf-8", errors="ignore").strip()
-                    if not raw:
-                        continue
-
-                    rr = parse_rr_line(raw)
-                    if rr is None:
-                        # READY とかデバッグ出力とか
-                        continue
-
-                    yield RRMessage(rr_ms=rr, raw_line=raw)
-
-        except serial.SerialException as e:
-            if not reconnect:
-                raise
-            print(f"[WARN] serial error: {e}  -> reconnecting...")
-            time.sleep(1.0)
-            continue
-
-
-def main():
-    print("Listening RR... (Ctrl+C to stop)")
-    for msg in rr_stream():
-        print(f"RR(ms)={msg.rr_ms}  raw='{msg.raw_line}'")
-
-
-if __name__ == "__main__":
-    main()
+            ser.close()
+        except Exception:
+            pass

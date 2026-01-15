@@ -1,385 +1,325 @@
 from __future__ import annotations
 
-import time
-import sqlite3
 import sys
-from dataclasses import dataclass
-from datetime import datetime
+import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
     QVBoxLayout,
-    QHBoxLayout,
     QLabel,
     QPushButton,
     QMessageBox,
+    QStackedWidget,
+    QFrame,
 )
 
-from src.sensors.serial_rr_reader import rr_stream
-from src.signal.pnn50 import PNN50Calculator
-from src.signal.state import FixedBaselineClassifier, Status
-
-from src.music.readmusic import get_now_playing
+from src.measure.session import MeasureSession, LiveState
+from src.storage.db import DigMusicDB
+from src.signal.state import Status
+from src.ui.heart_monitor import HeartMonitorWidget
 
 
 DB_PATH = Path("data") / "digmusic.db"
 
 
-# -------------------------
-# DB: baseline & events
-# -------------------------
-def get_conn(db_path: Path) -> sqlite3.Connection:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    return conn
+def format_mmss(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    m = seconds // 60
+    s = seconds % 60
+    return f"{m}:{s:02d}"
 
 
-def init_db(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS baseline (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            baseline_pnn50 REAL NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            status TEXT NOT NULL,
-            pnn50 REAL NOT NULL,
-            artist_name TEXT NOT NULL,
-            track_name TEXT NOT NULL
-        )
-        """
-    )
-    conn.commit()
-
-
-def save_baseline(conn: sqlite3.Connection, baseline_pnn50: float) -> int:
-    ts = datetime.now().isoformat(timespec="seconds")
-    cur = conn.execute(
-        "INSERT INTO baseline (ts, baseline_pnn50) VALUES (?, ?)",
-        (ts, float(baseline_pnn50)),
-    )
-    conn.commit()
-    return int(cur.lastrowid)
-
-
-def load_latest_baseline(conn: sqlite3.Connection) -> Optional[float]:
-    row = conn.execute(
-        "SELECT baseline_pnn50 FROM baseline ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    if row is None:
-        return None
-    return float(row["baseline_pnn50"])
-
-
-def insert_event(
-    conn: sqlite3.Connection,
-    ts: datetime,
-    status: Status,
-    pnn50: float,
-    artist: str,
-    track: str,
-) -> int:
-    cur = conn.execute(
-        """
-        INSERT INTO events (ts, status, pnn50, artist_name, track_name)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            ts.isoformat(timespec="seconds"),
-            status.value,
-            float(pnn50),
-            artist,
-            track,
-        ),
-    )
-    conn.commit()
-    return int(cur.lastrowid)
-
-
-def should_save_event(
-    conn: sqlite3.Connection,
-    ts: datetime,
-    status: Status,
-    artist: str,
-    track: str,
-    cooldown_seconds: int = 60,
-) -> bool:
-    row = conn.execute(
-        """
-        SELECT ts, status, artist_name, track_name
-        FROM events
-        ORDER BY id DESC
-        LIMIT 1
-        """
-    ).fetchone()
-
-    if row is None:
-        return True
-
-    try:
-        last_ts = datetime.fromisoformat(row["ts"])
-    except Exception:
-        return True
-
-    if (ts - last_ts).total_seconds() < cooldown_seconds:
-        return False
-
-    if row["artist_name"] == artist and row["track_name"] == track and row["status"] == status.value:
-        return False
-
-    return True
-
-
-# -------------------------
-# Worker (QThread)
-# -------------------------
-@dataclass
-class LiveState:
-    hr: Optional[float]
-    pnn50: Optional[float]
-    smoothed: Optional[float]
-    baseline: Optional[float]
-    status: Status
-    mode: str  # "REST" or "RUN"
+def status_color(status: Status) -> str:
+    if status == Status.HYPE:
+        return "#FF7A1A"
+    if status == Status.CHILL:
+        return "#BDEFFF"
+    return "#EAEAEA"
 
 
 class MeasureWorker(QObject):
     update_signal = Signal(object)
-    info_signal = Signal(str)
     error_signal = Signal(str)
     finished_signal = Signal()
 
-    def __init__(self, db_path: Path):
+    def __init__(self, session: MeasureSession):
         super().__init__()
-        self.db_path = db_path
-        self._stop = False
-
-        self.calc = PNN50Calculator(window_beats=30, max_jump_ms=250)
-        self.clf = FixedBaselineClassifier(smooth_size=5, chill_delta=6.0, hype_delta=6.0)
-
-        self.rest_seconds_total = 60
-        self.rest_end_epoch: Optional[float] = None
-        self.rest_pnn50_values: list[float] = []
-
-        self.last_status: Status = Status.NEUTRAL
+        self.session = session
 
     def stop(self):
-        self._stop = True
-
-    def _emit(self, mode: str, p: Optional[float], hr: Optional[float], sm: Optional[float], base: Optional[float], st: Status):
-        self.update_signal.emit(
-            LiveState(
-                hr=hr,
-                pnn50=p,
-                smoothed=sm,
-                baseline=base,
-                status=st,
-                mode=mode,
-            )
-        )
+        self.session.stop()
 
     def run(self):
         try:
-            conn = get_conn(self.db_path)
-            init_db(conn)
+            for st in self.session.run():
+                self.update_signal.emit(st)
         except Exception as e:
-            self.error_signal.emit(f"DB初期化に失敗: {e}")
+            self.error_signal.emit(str(e))
+        finally:
             self.finished_signal.emit()
-            return
-
-        prev_base = load_latest_baseline(conn)
-        if prev_base is not None:
-            self.clf.set_baseline(prev_base)
-            self.info_signal.emit(f"前回のbaselineを読み込み: {prev_base:.1f}%")
-
-        self.info_signal.emit("計測開始：まず1分間安静にしてください。")
-        self.rest_end_epoch = time.time() + self.rest_seconds_total
-        self.rest_pnn50_values = []
-        self.last_status = Status.NEUTRAL
-
-        for msg in rr_stream():
-            if self._stop:
-                break
-
-            if not self.calc.add_rr(msg.rr_ms):
-                continue
-
-            p = self.calc.pnn50_percent()
-            hr = self.calc.hr_bpm()
-            if p is None:
-                continue
-
-            now = time.time()
-
-            if self.rest_end_epoch is not None and now < self.rest_end_epoch:
-                self.rest_pnn50_values.append(float(p))
-                sm, base, st = self.clf.update(p)
-                self._emit("REST", p, hr, sm, base, Status.NEUTRAL)
-                continue
-
-            if self.rest_end_epoch is not None and now >= self.rest_end_epoch:
-                self.rest_end_epoch = None
-
-                if len(self.rest_pnn50_values) == 0:
-                    self.error_signal.emit("安静1分中にpNN50が取得できませんでした。")
-                    break
-
-                baseline = sum(self.rest_pnn50_values) / len(self.rest_pnn50_values)
-                self.clf.set_baseline(baseline)
-
-                try:
-                    baseline_id = save_baseline(conn, baseline)
-                    self.info_signal.emit(f"baseline確定: {baseline:.1f}%（保存ID={baseline_id}）")
-                except Exception as e:
-                    self.error_signal.emit(f"baseline保存に失敗: {e}")
-                    break
-
-            sm, base, st = self.clf.update(p)
-            self._emit("RUN", p, hr, sm, base, st)
-
-            if self.last_status != st and st in (Status.CHILL, Status.HYPE):
-                now_playing = get_now_playing()
-                if now_playing is None:
-                    self.info_signal.emit("[WARN] 曲情報が取得できないので保存をスキップ")
-                    self.last_status = st
-                    continue
-
-                artist, track = now_playing
-                ts = datetime.now()
-
-                try:
-                    if should_save_event(conn, ts, st, artist, track, cooldown_seconds=60):
-                        value_to_save = float(sm) if sm is not None else float(p)
-                        new_id = insert_event(conn, ts, st, value_to_save, artist, track)
-                        self.info_signal.emit(f"[SAVED] id={new_id} {st.value} pNN50={value_to_save:.1f}% {artist} - {track}")
-                    else:
-                        self.info_signal.emit("[SKIP] クールダウン/同曲で抑止")
-                except Exception as e:
-                    self.error_signal.emit(f"イベント保存に失敗: {e}")
-                    break
-
-            self.last_status = st
-
-        self.finished_signal.emit()
 
 
-# -------------------------
-# Main GUI
-# -------------------------
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("DigMusic - Main")
-        self.resize(720, 360)
+        self.setWindowTitle("DigMusic")
+        self.resize(820, 520)
 
-        self.conn = get_conn(DB_PATH)
-        init_db(self.conn)
+        self.stack = QStackedWidget()
+        self.home_screen = self._build_home()
+        self.measure_screen = self._build_measure()
 
-        self.status_label = QLabel("状態: -")
-        self.mode_label = QLabel("モード: -")
-        self.countdown_label = QLabel("安静カウントダウン: -")
-        self.metrics_label = QLabel("HR: -   pNN50: -   sm: -   base: -")
-        self.info_label = QLabel("")
-        self.info_label.setWordWrap(True)
+        self.stack.addWidget(self.home_screen)
+        self.stack.addWidget(self.measure_screen)
 
-        self.start_btn = QPushButton("計測開始")
-        self.stop_btn = QPushButton("停止")
-        self.stop_btn.setEnabled(False)
-        self.logs_btn = QPushButton("ログ確認（DB Viewer）")
-
-        root = QVBoxLayout()
-        root.addWidget(self.mode_label)
-        root.addWidget(self.countdown_label)
-        root.addWidget(self.metrics_label)
-        root.addWidget(self.status_label)
-        root.addSpacing(12)
-        root.addWidget(self.info_label)
-
-        btns = QHBoxLayout()
-        btns.addWidget(self.start_btn)
-        btns.addWidget(self.stop_btn)
-        btns.addStretch(1)
-        btns.addWidget(self.logs_btn)
-        root.addLayout(btns)
-
-        self.setLayout(root)
+        layout = QVBoxLayout()
+        layout.addWidget(self.stack)
+        self.setLayout(layout)
 
         self.thread: Optional[QThread] = None
         self.worker: Optional[MeasureWorker] = None
 
+        # REST timer (UI independent)
+        self.ui_rest_timer = QTimer(self)
+        self.ui_rest_timer.setInterval(200)  # 見た目滑らかにしたいなら200ms
+        self.ui_rest_timer.timeout.connect(self._tick_rest_timer)
+        self.rest_total_sec = 60
+        self.rest_start_epoch: Optional[float] = None
+        self.in_rest_mode = False
+
+    # ---------- Home ----------
+    def _build_home(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
+
+        layout.addStretch(2)
+
+        title = QLabel("DigMusic")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size:56px; font-weight:800;")
+        layout.addWidget(title)
+
+        layout.addStretch(3)
+
+        self.start_btn = QPushButton("計測開始")
+        self.logs_btn = QPushButton("ログ確認")
+        self.start_btn.setFixedHeight(56)
+        self.logs_btn.setFixedHeight(56)
+        self.start_btn.setStyleSheet("font-size:18px;")
+        self.logs_btn.setStyleSheet("font-size:18px;")
+
+        layout.addWidget(self.start_btn)
+        layout.addWidget(self.logs_btn)
+
+        layout.addStretch(1)
+
         self.start_btn.clicked.connect(self.start_measurement)
-        self.stop_btn.clicked.connect(self.stop_measurement)
         self.logs_btn.clicked.connect(self.open_logs)
 
-        prev = load_latest_baseline(self.conn)
-        if prev is not None:
-            self.info_label.setText(f"前回baseline: {prev:.1f}%（計測開始で新しいbaselineを作ります）")
+        w.setLayout(layout)
+        return w
 
-    def start_measurement(self):
-        if self.thread is not None:
+    # ---------- Measure ----------
+    def _build_measure(self) -> QWidget:
+        w = QWidget()
+        root = QVBoxLayout()
+        root.setContentsMargins(24, 24, 24, 24)
+        root.setSpacing(18)
+
+        # Status card
+        self.status_card = QFrame()
+        self.status_card.setObjectName("statusCard")
+        self.status_card.setStyleSheet("""
+            QFrame#statusCard { background: #EAEAEA; border-radius: 28px; }
+        """)
+        self.status_card.setMinimumHeight(200)
+
+        card_layout = QVBoxLayout()
+        card_layout.setContentsMargins(24, 20, 24, 20)
+        card_layout.setSpacing(8)
+
+        self.rest_label = QLabel("REST 1:00")
+        self.rest_label.setAlignment(Qt.AlignLeft)
+        self.rest_label.setStyleSheet("font-size:16px; font-weight:600; color:#000;")
+        card_layout.addWidget(self.rest_label)
+
+        self.big_status = QLabel("NEUTRAL")
+        self.big_status.setAlignment(Qt.AlignCenter)
+        self.big_status.setStyleSheet("font-size:64px; font-weight:800; color:#000;")
+        card_layout.addWidget(self.big_status)
+
+        self.pnn50_line = QLabel("pNN50: -   base: -")
+        self.pnn50_line.setAlignment(Qt.AlignCenter)
+        self.pnn50_line.setStyleSheet("font-size:18px; font-weight:500; color:#000;")
+        card_layout.addWidget(self.pnn50_line)
+
+        self.status_card.setLayout(card_layout)
+
+        # Track
+        self.track_label = QLabel("—")
+        self.track_label.setAlignment(Qt.AlignCenter)
+        self.track_label.setStyleSheet("font-size:20px; font-weight:600;")
+
+        # Monitor card
+        self.monitor_card = QFrame()
+        self.monitor_card.setObjectName("monitorCard")
+        self.monitor_card.setStyleSheet("""
+            QFrame#monitorCard { background: #BDEFFF; border-radius: 28px; }
+        """)
+        self.monitor_card.setMinimumHeight(180)
+
+        monitor_layout = QVBoxLayout()
+        monitor_layout.setContentsMargins(18, 18, 18, 18)
+        monitor_layout.setSpacing(10)
+
+        monitor_title = QLabel("心拍(心電図)モニター")
+        monitor_title.setAlignment(Qt.AlignCenter)
+        monitor_title.setStyleSheet("font-size:18px; font-weight:700; color:#000;")
+        monitor_layout.addWidget(monitor_title)
+
+        self.monitor_widget = HeartMonitorWidget(window_sec=10.0, y_min=0.0, y_max=200.0)
+        monitor_layout.addWidget(self.monitor_widget)
+
+        self.hr_text = QLabel("HR: - bpm")
+        self.hr_text.setAlignment(Qt.AlignCenter)
+        self.hr_text.setStyleSheet("font-size:16px; font-weight:600; color:#000;")
+        monitor_layout.addWidget(self.hr_text)
+
+        self.monitor_card.setLayout(monitor_layout)
+
+        self.info_label = QLabel("")
+        self.info_label.setAlignment(Qt.AlignCenter)
+        self.info_label.setWordWrap(True)
+        self.info_label.setStyleSheet("color:#444;")
+
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.setFixedHeight(48)
+        self.stop_btn.setStyleSheet("font-size:16px;")
+        self.stop_btn.clicked.connect(self.stop_measurement)
+
+        root.addWidget(self.status_card)
+        root.addWidget(self.track_label)
+        root.addWidget(self.monitor_card)
+        root.addWidget(self.info_label)
+        root.addWidget(self.stop_btn)
+
+        w.setLayout(root)
+        return w
+
+    # ---------- REST Timer tick (UI independent) ----------
+    def _start_rest_ui_timer(self):
+        self.in_rest_mode = True
+        self.rest_start_epoch = time.time()
+        # ここで即座に 1:00 表示
+        self.rest_label.setText(f"REST {format_mmss(self.rest_total_sec)}")
+        self.big_status.setText("REST")
+        self.status_card.setStyleSheet("""
+            QFrame#statusCard { background: #EAEAEA; border-radius: 28px; }
+        """)
+        self.ui_rest_timer.start()
+
+    def _stop_rest_ui_timer(self):
+        self.in_rest_mode = False
+        self.rest_start_epoch = None
+        self.ui_rest_timer.stop()
+
+    def _tick_rest_timer(self):
+        if not self.in_rest_mode or self.rest_start_epoch is None:
             return
+        elapsed = time.time() - self.rest_start_epoch
+        remain = self.rest_total_sec - int(elapsed)
+        remain = max(0, remain)
+        self.rest_label.setText(f"REST {format_mmss(remain)}")
+        if remain <= 0:
+            # 表示上は0になったら止めてOK（実際のbaseline確定は計測側がやる）
+            self.ui_rest_timer.stop()
 
+    # ---------- Controls ----------
+    def start_measurement(self):
+        self.stack.setCurrentWidget(self.measure_screen)
         self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
         self.logs_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.info_label.setText("計測開始：安静にしてください")
 
-        self.info_label.setText("計測準備中...")
+        # RESTタイマーはUIで独立スタート
+        self._start_rest_ui_timer()
+
+        db = DigMusicDB(DB_PATH)
+        session = MeasureSession(
+            db=db,
+            rest_total_sec=self.rest_total_sec,
+            hr_window_sec=10.0,
+            track_poll_interval=2.0,
+            cooldown_seconds=60,
+            serial_port=None,   # 固定したいなら "COM4" とか
+            baudrate=115200,
+        )
 
         self.thread = QThread()
-        self.worker = MeasureWorker(DB_PATH)
+        self.worker = MeasureWorker(session)
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)
         self.worker.update_signal.connect(self.on_update)
-        self.worker.info_signal.connect(self.on_info)
         self.worker.error_signal.connect(self.on_error)
         self.worker.finished_signal.connect(self.on_finished)
 
         self.thread.start()
 
     def stop_measurement(self):
-        if self.worker is not None:
-            self.worker.stop()
         self.info_label.setText("停止処理中...")
+        self.stop_btn.setEnabled(False)
+        if self.worker:
+            self.worker.stop()
 
-    def on_update(self, state: LiveState):
-        self.mode_label.setText(f"モード: {state.mode}")
+    def on_update(self, st: LiveState):
+        # 曲名は常時表示
+        self.track_label.setText(st.track_text)
 
-        if state.mode == "REST" and self.worker is not None and self.worker.rest_end_epoch is not None:
-            remain = max(0, int(self.worker.rest_end_epoch - time.time()))
-            self.countdown_label.setText(f"安静カウントダウン: 残り {remain} 秒（動かないでね）")
+        # HRモニタは常時更新
+        if st.hr is None:
+            self.hr_text.setText("HR: - bpm")
         else:
-            self.countdown_label.setText("安静カウントダウン: -")
+            self.hr_text.setText(f"HR: {st.hr:.1f} bpm")
+        self.monitor_widget.set_points(st.hr_points)
 
-        hr = "-" if state.hr is None else f"{state.hr:.1f} bpm"
-        p = "-" if state.pnn50 is None else f"{state.pnn50:.1f}%"
-        sm = "-" if state.smoothed is None else f"{state.smoothed:.1f}%"
-        base = "-" if state.baseline is None else f"{state.baseline:.1f}%"
-        self.metrics_label.setText(f"HR: {hr}   pNN50: {p}   sm: {sm}   base: {base}")
+        # pNN50/base
+        ptxt = "-" if st.smoothed is None else f"{st.smoothed:.1f}"
+        btxt = "-" if st.baseline is None else f"{st.baseline:.1f}"
+        self.pnn50_line.setText(f"pNN50: {ptxt}   base: {btxt}")
 
-        self.status_label.setText(f"状態: {state.status.value}")
+        # REST -> RUN に入ったらUI側RESTタイマーを止め、RUN表示へ
+        if st.mode == "RUN":
+            if self.in_rest_mode:
+                self._stop_rest_ui_timer()
 
-    def on_info(self, msg: str):
-        self.info_label.setText(msg)
+            self.rest_label.setText("")  # RUN中は非表示
+            self.big_status.setText(st.status.value)
+            self.status_card.setStyleSheet(f"""
+                QFrame#statusCard {{
+                    background: {status_color(st.status)};
+                    border-radius: 28px;
+                }}
+            """)
+        else:
+            # REST中の見た目はUI側タイマーに任せる（ここではbig_status等を上書きしない）
+            pass
 
     def on_error(self, msg: str):
         QMessageBox.critical(self, "Error", msg)
-        self.info_label.setText(msg)
 
     def on_finished(self):
-        if self.thread is not None:
+        # 計測が終わったらUI RESTタイマーも止める
+        self._stop_rest_ui_timer()
+
+        if self.thread:
             self.thread.quit()
             self.thread.wait()
 
@@ -387,17 +327,14 @@ class MainWindow(QWidget):
         self.worker = None
 
         self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
         self.logs_btn.setEnabled(True)
+        self.stop_btn.setEnabled(True)
 
-        self.info_label.setText("停止しました。")
+        self.stack.setCurrentWidget(self.home_screen)
 
     def open_logs(self):
-        try:
-            import subprocess
-            subprocess.Popen([sys.executable, "src/ui/db_viewer.py"])
-        except Exception as e:
-            QMessageBox.warning(self, "Logs", f"DB Viewer起動に失敗: {e}")
+        import subprocess
+        subprocess.Popen([sys.executable, "src/ui/db_viewer.py"])
 
 
 def main():
