@@ -11,12 +11,12 @@ from src.signal.pnn50 import PNN50Calculator
 from src.signal.state import FixedBaselineClassifier, Status
 from src.storage.db import DigMusicDB, EventRow
 
+from pathlib import Path
 
 DEBUG_PRINT = False
 
-from pathlib import Path
-
 LOG_PATH = Path("logs") / "measure_debug.log"
+
 
 def _dbg(msg: str) -> None:
     if not DEBUG_PRINT:
@@ -37,7 +37,6 @@ def _dbg(msg: str) -> None:
         pass
 
 
-
 @dataclass
 class LiveState:
     mode: str  # "REST" or "RUN"
@@ -49,6 +48,7 @@ class LiveState:
     status: Status
     track_text: str
     hr_points: List[Tuple[float, float]]  # (epoch, hr)
+    event_message: Optional[str] = None
 
 
 class MeasureSession:
@@ -74,23 +74,34 @@ class MeasureSession:
         # RRの大ジャンプでバッファリセット採用（前回のバグ対策）
         self.calc = PNN50Calculator(window_beats=30, max_jump_ms=600)
 
-        # ★判定を「若干厳しめ」に：deltaを上げる
-        # ここを好みで調整してOK（10.0→もう少し厳しめなら12〜15）
+        # 判定器（baselineはREST終了時に set_baseline する）
         self.clf = FixedBaselineClassifier(
             smooth_size=5,
-            chill_delta=10.0,
-            hype_delta=10.0,
+            hr_smooth_size=5,
+            status_switch_threshold=4,
+            # CHILL条件
+            chill_pnn50_ratio=1.10,   # 揺らぎ↑
+            chill_hr_ratio=1.08,      # 心拍ほぼ上がってない
+            # HYPE条件
+            hype_hr_ratio=1.10,       # 心拍↑
+            hype_pnn50_ratio=0.90,    # 揺らぎ↓
         )
 
         self._stop = False
 
+        # REST計測用
         self.rest_end_epoch: Optional[float] = None
         self.rest_p_values: List[float] = []
+        self.rest_hr_values: List[float] = []  # ★追加：REST中のHR平均もbaselineに必要
+
+        # baseline固定値（UI用）
         self.baseline_fixed: Optional[float] = None
 
+        # 曲名
         self.last_track_poll = 0.0
         self.track_text = "—"
 
+        # HRグラフ用
         self.hr_points: List[Tuple[float, float]] = []
 
         # 15秒継続保存用の状態
@@ -99,6 +110,7 @@ class MeasureSession:
         self._pending_track: Optional[str] = None
         self._pending_saved: bool = False
         self._pending_required_sec: float = 15.0
+        self._last_event_message: Optional[str] = None
 
         # 参考用（ログ）
         self._last_status: Status = Status.NEUTRAL
@@ -138,6 +150,14 @@ class MeasureSession:
         self._pending_since = None
         self._pending_track = None
         self._pending_saved = False
+
+    def _emit_event_message(self, message: str) -> None:
+        self._last_event_message = message
+
+    def _consume_event_message(self) -> Optional[str]:
+        msg = self._last_event_message
+        self._last_event_message = None
+        return msg
 
     def _update_pending_and_maybe_save(
         self,
@@ -180,8 +200,9 @@ class MeasureSession:
 
         elapsed = now_epoch - self._pending_since
         if elapsed < self._pending_required_sec:
-            # 進捗ログ欲しいならここで出してもいい（うるさいならコメントアウト）
-            _dbg(f"[PENDING] running {status.value} {elapsed:.1f}/{self._pending_required_sec:.0f}s track='{self.track_text}'")
+            _dbg(
+                f"[PENDING] running {status.value} {elapsed:.1f}/{self._pending_required_sec:.0f}s track='{self.track_text}'"
+            )
             return
 
         # 15秒継続達成 → 保存
@@ -190,8 +211,6 @@ class MeasureSession:
         _dbg(f"[SAVE] eligible (15s sustained) cooldown_ok={can}")
 
         if not can:
-            # cooldownで弾かれた場合は「保存済み扱いにはしない」
-            # 次の継続でまた保存を試みる
             return
 
         # track_text を分割
@@ -200,26 +219,38 @@ class MeasureSession:
         else:
             artist, track = "Unknown", self.track_text
 
-        self.db.insert_event(EventRow(
-            ts=ts,
-            status=status,
-            pnn50=value_to_save,
-            artist_name=artist,
-            track_name=track,
-        ))
+        self.db.insert_event(
+            EventRow(
+                ts=ts,
+                status=status,
+                pnn50=value_to_save,
+                artist_name=artist,
+                track_name=track,
+            )
+        )
         self._pending_saved = True
-        _dbg(f"[SAVE] inserted event: {ts.isoformat(timespec='seconds')} {status.value} pNN50={value_to_save:.2f} '{artist} - {track}'")
+        _dbg(
+            f"[SAVE] inserted event: {ts.isoformat(timespec='seconds')} {status.value} pNN50={value_to_save:.2f} '{artist} - {track}'"
+        )
+        self._emit_event_message(
+            f"{status.value}を保存: {artist} - {track} (pNN50={value_to_save:.1f}%)"
+        )
 
     def run(self) -> Iterator[LiveState]:
         self.db.init_db()
 
+        # REST開始
         self.rest_end_epoch = time.time() + self.rest_total_sec
         self.rest_p_values = []
+        self.rest_hr_values = []
         self.baseline_fixed = None
+
         self._reset_pending("session start")
         self._last_status = Status.NEUTRAL
 
-        _dbg(f"[MeasureSession] started (REST {self.rest_total_sec}s) port={self.serial_port or 'AUTO'} baud={self.baudrate}")
+        _dbg(
+            f"[MeasureSession] started (REST {self.rest_total_sec}s) port={self.serial_port or 'AUTO'} baud={self.baudrate}"
+        )
 
         for msg in rr_stream(
             port=self.serial_port,
@@ -246,7 +277,11 @@ class MeasureSession:
             hr_s = "None" if hr is None else f"{hr:.1f}"
             p_s = "None" if p is None else f"{p:.1f}"
             now = time.time()
-            mode_s = "REST" if (self.rest_end_epoch is not None and now < self.rest_end_epoch) else "RUN?"
+            mode_s = (
+                "REST"
+                if (self.rest_end_epoch is not None and now < self.rest_end_epoch)
+                else "RUN?"
+            )
             _dbg(f"[CALC] HR={hr_s} bpm  pNN50={p_s}%  mode={mode_s} track='{self.track_text}'")
 
             # -----------------------
@@ -255,9 +290,14 @@ class MeasureSession:
             if self.rest_end_epoch is not None and now < self.rest_end_epoch:
                 remain = int(self.rest_end_epoch - now)
 
+                # baseline用 pNN50
                 if p is not None:
                     self.rest_p_values.append(float(p))
                     _dbg(f"[REST] remain={remain}s  collected_pnn50={len(self.rest_p_values)}")
+
+                # ★baseline用 HR（Noneは捨てる）
+                if hr is not None:
+                    self.rest_hr_values.append(float(hr))
 
                 # REST中は保存ロジックを動かさない
                 self._reset_pending("REST mode")
@@ -272,11 +312,12 @@ class MeasureSession:
                     status=Status.NEUTRAL,
                     track_text=self.track_text,
                     hr_points=list(self.hr_points),
+                    event_message=self._consume_event_message(),
                 )
                 continue
 
             # -----------------------
-            # REST終了 → baseline確定
+            # REST終了 → baseline確定（1回だけ）
             # -----------------------
             if self.rest_end_epoch is not None and now >= self.rest_end_epoch:
                 self.rest_end_epoch = None
@@ -288,12 +329,25 @@ class MeasureSession:
                         "初期のRRが不安定な可能性があるので、センサを付け直す/数十秒待ってから再実行してね。"
                     )
 
-                baseline = sum(self.rest_p_values) / len(self.rest_p_values)
-                self.baseline_fixed = baseline
-                self.clf.set_baseline(baseline)
-                self.db.save_baseline(baseline)
+                if len(self.rest_hr_values) == 0:
+                    _dbg("[REST] baseline failed: no HR samples")
+                    raise RuntimeError(
+                        "REST中にHRが取得できませんでした。"
+                        "RRが途切れている/センサが外れている可能性があります。付け直して再実行してね。"
+                    )
 
-                _dbg(f"[REST->RUN] baseline_fixed={baseline:.2f}%  samples={len(self.rest_p_values)}")
+                baseline_pnn50 = sum(self.rest_p_values) / len(self.rest_p_values)
+                baseline_hr = sum(self.rest_hr_values) / len(self.rest_hr_values)
+
+                # ★ここで1回だけ
+                self.clf.set_baseline(baseline_pnn50, baseline_hr)
+
+                self.baseline_fixed = baseline_pnn50
+                self.db.save_baseline(baseline_pnn50)
+
+                _dbg(
+                    f"[REST->RUN] baseline_fixed={baseline_pnn50:.2f}% baseline_hr={baseline_hr:.1f}  samples_pnn50={len(self.rest_p_values)} samples_hr={len(self.rest_hr_values)}"
+                )
 
                 self._reset_pending("baseline fixed")
 
@@ -303,10 +357,11 @@ class MeasureSession:
                     hr=hr,
                     pnn50=(float(p) if p is not None else None),
                     smoothed=None,
-                    baseline=float(baseline),
+                    baseline=float(baseline_pnn50),
                     status=Status.NEUTRAL,
                     track_text=self.track_text,
                     hr_points=list(self.hr_points),
+                    event_message=self._consume_event_message(),
                 )
                 continue
 
@@ -327,6 +382,7 @@ class MeasureSession:
                     status=Status.NEUTRAL,
                     track_text=self.track_text,
                     hr_points=list(self.hr_points),
+                    event_message=self._consume_event_message(),
                 )
                 continue
 
@@ -338,10 +394,12 @@ class MeasureSession:
             # -----------------------
             # RUN: 判定
             # -----------------------
-            sm, base, status = self.clf.update(float(p))
-            _dbg(f"[STATE] pNN50={p:.2f}% smoothed={None if sm is None else round(sm,2)} base={None if base is None else round(base,2)} status={status.value}")
+            sm, base, status = self.clf.update(pnn50=float(p), hr=hr)
+            _dbg(
+                f"[STATE] pNN50={p:.2f}% smoothed={None if sm is None else round(sm,2)} base={None if base is None else round(base,2)} status={status.value}"
+            )
 
-            # ★保存に使う値は「smoothed優先、なければpNN50」
+            # 保存に使う値は「smoothed優先、なければpNN50」
             value_for_save = float(sm) if sm is not None else float(p)
 
             # 15秒継続判定 → 保存
@@ -361,6 +419,7 @@ class MeasureSession:
                 status=status,
                 track_text=self.track_text,
                 hr_points=list(self.hr_points),
+                event_message=self._consume_event_message(),
             )
 
             self._last_status = status

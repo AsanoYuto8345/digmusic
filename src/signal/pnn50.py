@@ -26,9 +26,11 @@ class PNN50Calculator:
         self.window_beats = int(window_beats)
         self.max_jump_ms = int(max_jump_ms)
         self._rr: List[int] = []
+        self._last_pnn50: Optional[float] = None
 
     def reset(self) -> None:
         self._rr.clear()
+        self._last_pnn50 = None
 
     def add_rr(self, rr_ms: int) -> bool:
         rr_ms = int(rr_ms)
@@ -75,7 +77,9 @@ class PNN50Calculator:
 
         diffs = [abs(self._rr[i] - self._rr[i - 1]) for i in range(1, len(self._rr))]
         if len(diffs) < int(min_diffs):
-            return None
+            return self._last_pnn50
 
         cnt = sum(1 for d in diffs if d > 50)
-        return 100.0 * cnt / len(diffs)
+        value = max(0.0, min(100.0, 100.0 * cnt / len(diffs)))
+        self._last_pnn50 = value
+        return value

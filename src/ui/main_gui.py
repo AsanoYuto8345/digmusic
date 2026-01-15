@@ -90,13 +90,13 @@ class MainWindow(QWidget):
         self.rest_total_sec = 60
         self.rest_start_epoch: Optional[float] = None
         self.in_rest_mode = False
-        
+        self._event_message_expire = 0.0
+
         # # UI alive heartbeat (debug)
         # self._ui_hb = QTimer(self)
         # self._ui_hb.setInterval(1000)
         # self._ui_hb.timeout.connect(lambda: print("[UI] alive", flush=True))
         # self._ui_hb.start()
-
 
     # ---------- Home ----------
     def _build_home(self) -> QWidget:
@@ -203,7 +203,14 @@ class MainWindow(QWidget):
         self.info_label = QLabel("")
         self.info_label.setAlignment(Qt.AlignCenter)
         self.info_label.setWordWrap(True)
-        self.info_label.setStyleSheet("color:#444;")
+        self.info_label.setStyleSheet("""
+            color:#111;
+            background:#FFFFFF;
+            border-radius:18px;
+            padding:12px;
+            font-size:15px;
+            font-weight:600;
+        """)
 
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setFixedHeight(48)
@@ -287,6 +294,7 @@ class MainWindow(QWidget):
             self.worker.stop()
 
     def on_update(self, st: LiveState):
+        now = time.time()
         # 曲名は常時表示
         self.track_label.setText(st.track_text)
 
@@ -302,10 +310,21 @@ class MainWindow(QWidget):
         btxt = "-" if st.baseline is None else f"{st.baseline:.1f}"
         self.pnn50_line.setText(f"pNN50: {ptxt}   base: {btxt}")
 
+        if st.event_message:
+            self._event_message_expire = now + 4.0
+            self.info_label.setText(st.event_message)
+        elif now >= self._event_message_expire:
+            if st.mode == "REST":
+                self.info_label.setText("RESTモード：安静にしてください")
+            else:
+                self.info_label.setText("RUNモード：状態を解析しています")
+
         # REST -> RUN に入ったらUI側RESTタイマーを止め、RUN表示へ
         if st.mode == "RUN":
             if self.in_rest_mode:
                 self._stop_rest_ui_timer()
+                if now >= self._event_message_expire:
+                    self.info_label.setText("RUNモード：状態を解析しています")
 
             self.rest_label.setText("")  # RUN中は非表示
             self.big_status.setText(st.status.value)
