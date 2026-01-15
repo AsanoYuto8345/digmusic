@@ -9,24 +9,33 @@ from typing import Deque, Optional
 class PNN50Calculator:
     """
     RR(ms) を順に追加していき、直近 window_beats 拍分で pNN50(%) を計算する。
-    - RR差分 |RR[i]-RR[i-1]| > 50ms の割合(%)
+    - |RR[i]-RR[i-1]| > threshold_ms の割合(%)
     - 外れ値RRは捨てる
+    - 直前RRからの急変も捨てる（偽ピーク対策）
     """
-    window_beats: int = 30              # 直近30拍で計算（おすすめ）
-    threshold_ms: int = 50              # pNN50の定義
-    rr_min_ms: int = 300                # 200bpm相当
-    rr_max_ms: int = 2000               # 30bpm相当
+    window_beats: int = 30
+    threshold_ms: int = 50
+    rr_min_ms: int = 300
+    rr_max_ms: int = 2000
+
+    # ★追加：急変フィルタ
+    max_jump_ms: int = 250  # 直前RRとの差がこれより大きければ捨てる（調整可）
 
     rr: Deque[int] = field(default_factory=lambda: deque(maxlen=30))
 
     def add_rr(self, rr_ms: int) -> bool:
-        """RRを追加。追加できたらTrue、外れ値ならFalse。"""
         if rr_ms < self.rr_min_ms or rr_ms > self.rr_max_ms:
             return False
-        # dequeのmaxlenはdataclass初期化時に固定されるので、window変更に対応したいなら再構築する
+
+        if self.rr:
+            prev = self.rr[-1]
+            if abs(rr_ms - prev) > self.max_jump_ms:
+                return False
+
         if self.rr.maxlen != self.window_beats:
             old = list(self.rr)[-self.window_beats:]
             self.rr = deque(old, maxlen=self.window_beats)
+
         self.rr.append(rr_ms)
         return True
 
@@ -34,10 +43,6 @@ class PNN50Calculator:
         return len(self.rr) >= self.window_beats
 
     def pnn50_percent(self) -> Optional[float]:
-        """pNN50(%)。データ不足ならNone。"""
-        if len(self.rr) < 2:
-            return None
-        # window未満でも計算したいならここを is_ready にしない
         if not self.is_ready():
             return None
 
@@ -49,7 +54,6 @@ class PNN50Calculator:
         return (count / len(diffs)) * 100.0
 
     def hr_bpm(self) -> Optional[float]:
-        """直近RRから心拍数(bpm)推定。"""
         if not self.rr:
             return None
         return 60000.0 / float(self.rr[-1])
