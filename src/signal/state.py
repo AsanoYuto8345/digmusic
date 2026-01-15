@@ -14,6 +14,9 @@ class Status(str, Enum):
 
 @dataclass
 class RollingMean:
+    """
+    pNN50の移動平均用（判定のブレを抑える）
+    """
     size: int = 5
     _buf: Deque[float] = field(default_factory=lambda: deque(maxlen=5))
 
@@ -33,57 +36,45 @@ class RollingMean:
 
 
 @dataclass
-class BaselineTracker:
+class FixedBaselineClassifier:
     """
-    ゆっくり追従するベースライン（指数移動平均EMA）
-    """
-    alpha: float = 0.02  # 小さいほどゆっくり（0.01〜0.05目安）
-    value: Optional[float] = None
-
-    def update(self, x: float) -> float:
-        x = float(x)
-        if self.value is None:
-            self.value = x
-        else:
-            self.value = (1.0 - self.alpha) * self.value + self.alpha * x
-        return self.value
-
-
-@dataclass
-class StateClassifier:
-    """
-    pNN50の「平均との差分」で状態を判定する。
-    - smooth_size: pNN50の移動平均窓
-    - chill_delta / hype_delta: ベースラインとの差分閾値（%ポイント）
+    baselineを動的に更新せず、「最初の安静1分の平均pNN50」を固定基準として使う。
+    判定は smoothed_pnn50 - baseline の差分（%ポイント）で行う。
     """
     smooth_size: int = 5
-    baseline_alpha: float = 0.02
-
-    chill_delta: float = 6.0  # baselineより +6%以上なら CHILL（調整可）
-    hype_delta: float = 6.0   # baselineより -6%以上なら HYPE（調整可）
+    chill_delta: float = 6.0   # baselineより +6%以上で CHILL
+    hype_delta: float = 6.0    # baselineより -6%以上で HYPE
 
     smooth: RollingMean = field(init=False)
-    baseline: BaselineTracker = field(init=False)
+    baseline: Optional[float] = None
 
     def __post_init__(self) -> None:
         self.smooth = RollingMean(size=self.smooth_size)
-        self.baseline = BaselineTracker(alpha=self.baseline_alpha)
+
+    def set_baseline(self, baseline_pnn50: float) -> None:
+        self.baseline = float(baseline_pnn50)
+
+    def has_baseline(self) -> bool:
+        return self.baseline is not None
 
     def update(self, pnn50: float) -> tuple[Optional[float], Optional[float], Status]:
         """
         戻り値:
           (smoothed_pnn50, baseline, status)
+        baseline未設定 or 平滑化不足の間は NEUTRAL を返す。
         """
         self.smooth.add(pnn50)
         sm = self.smooth.mean()
+
+        if self.baseline is None:
+            return sm, None, Status.NEUTRAL
+
         if sm is None or not self.smooth.is_ready():
-            return None, None, Status.NEUTRAL
+            return sm, self.baseline, Status.NEUTRAL
 
-        base = self.baseline.update(sm)
-        delta = sm - base
-
+        delta = sm - self.baseline
         if delta >= self.chill_delta:
-            return sm, base, Status.CHILL
+            return sm, self.baseline, Status.CHILL
         if delta <= -self.hype_delta:
-            return sm, base, Status.HYPE
-        return sm, base, Status.NEUTRAL
+            return sm, self.baseline, Status.HYPE
+        return sm, self.baseline, Status.NEUTRAL
